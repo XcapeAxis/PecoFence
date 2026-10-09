@@ -218,6 +218,14 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     if cfg.schema_version == 0 || cfg.schema_version > SCHEMA_VERSION {
         return Err(format!("unsupported schemaVersion {}", cfg.schema_version));
     }
+    for (id, item) in &cfg.items {
+        if *id != item.id {
+            return Err(format!(
+                "catalog item id {} does not match its key {id}",
+                item.id
+            ));
+        }
+    }
     for layout in &cfg.layouts {
         if layout.fences.len() > MAX_FENCES {
             return Err(format!("too many fences: {}", layout.fences.len()));
@@ -526,6 +534,24 @@ mod tests {
         c
     }
 
+    fn catalog_item(id: ItemId, path: &str) -> Item {
+        Item {
+            id,
+            key: ItemKey::from_path(path),
+            origin: Origin::UserDesktop,
+            display_name: "sample.txt".into(),
+            file_id: None,
+            mtime: 0,
+            is_folder: false,
+            attrs: 0,
+            icon_key: IconKey::ByExt("txt".into()),
+            orphaned_since: None,
+            size: 0,
+            open_count: 0,
+            last_opened: None,
+        }
+    }
+
     #[test]
     fn save_then_load_primary() {
         let store = ConfigStore::new(tmpdir("primary"));
@@ -534,6 +560,103 @@ mod tests {
         assert!(store.primary_path().exists());
         assert!(!store.tmp_path().exists());
         assert_eq!(store.list_backups().len(), 1);
+    }
+
+    #[test]
+    fn catalog_item_id_mismatch_save_keeps_primary_backups_and_input_unchanged() {
+        let store = ConfigStore::new(tmpdir("catalog-id-save-guard"));
+        let mut cfg = sample();
+        let id = uuid::Uuid::new_v4();
+        cfg.items
+            .insert(id, catalog_item(id, "C:\\Synthetic\\sample.txt"));
+        store.save(&cfg).unwrap();
+        cfg.settings.icon_size = 64;
+        store.save(&cfg).unwrap();
+        let primary = fs::read(store.primary_path()).unwrap();
+        let backup = fs::read(store.bak_path()).unwrap();
+        let backups: Vec<_> = store
+            .list_backups()
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        cfg.items.get_mut(&id).unwrap().id = uuid::Uuid::new_v4();
+        let invalid = serde_json::to_value(&cfg).unwrap();
+        let error = store.save(&cfg).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("catalog item id"));
+        assert_eq!(fs::read(store.primary_path()).unwrap(), primary);
+        assert_eq!(fs::read(store.bak_path()).unwrap(), backup);
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), invalid);
+        for (path, bytes) in backups {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert!(!store.tmp_path().exists());
+        let LoadOutcome::Primary(loaded) = store.load() else {
+            panic!("the valid primary must remain loadable after a refused save");
+        };
+        assert_eq!(loaded.items[&id].id, id);
+        assert_eq!(loaded.settings.icon_size, 64);
+    }
+
+    #[test]
+    fn catalog_item_id_mismatch_load_refuses_and_preserves_the_original_bytes() {
+        let store = ConfigStore::new(tmpdir("catalog-id-load-guard"));
+        let mut cfg = sample();
+        let id = uuid::Uuid::new_v4();
+        cfg.items
+            .insert(id, catalog_item(id, "C:\\Synthetic\\sample.txt"));
+        store.save(&cfg).unwrap();
+        store.save(&cfg).unwrap();
+        let backup = fs::read(store.bak_path()).unwrap();
+        let valid_items = cfg.items.clone();
+        cfg.items.get_mut(&id).unwrap().id = uuid::Uuid::new_v4();
+        let original = serde_json::to_vec_pretty(&cfg).unwrap();
+        fs::write(store.primary_path(), &original).unwrap();
+        assert!(
+            ConfigStore::parse_file(&store.primary_path())
+                .unwrap_err()
+                .contains("catalog item id")
+        );
+        assert_eq!(fs::read(store.primary_path()).unwrap(), original);
+        let (outcome, quarantined) = store.load_reporting();
+        let LoadOutcome::Recovered(loaded, from) = outcome else {
+            panic!("a mismatched catalog must not become a primary configuration");
+        };
+        assert_eq!(from, store.bak_path());
+        assert_eq!(loaded.items, valid_items);
+        assert_eq!(fs::read(quarantined.unwrap()).unwrap(), original);
+        assert_eq!(fs::read(store.bak_path()).unwrap(), backup);
+        assert!(!store.primary_path().exists());
+        assert!(!store.tmp_path().exists());
+    }
+
+    #[test]
+    fn matching_catalog_item_ids_round_trip_with_distinct_ids_for_the_same_path() {
+        let store = ConfigStore::new(tmpdir("catalog-id-shared-path"));
+        let mut cfg = sample();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        for id in [first, second] {
+            cfg.items
+                .insert(id, catalog_item(id, "C:\\Synthetic\\shared.txt"));
+            cfg.layouts[0].fences[0].items.push(ItemRef {
+                item_id: id,
+                manual_index: None,
+                assigned_by: AssignedBy::User,
+            });
+        }
+        store.save(&cfg).unwrap();
+        let parsed = ConfigStore::parse_file(&store.primary_path()).unwrap();
+        assert_eq!(parsed.items, cfg.items);
+        let LoadOutcome::Primary(loaded) = store.load() else {
+            panic!("matching identities with shared paths must remain valid");
+        };
+        assert_eq!(loaded.items, cfg.items);
+        assert_eq!(loaded.items[&first].key, loaded.items[&second].key);
+        assert_eq!(loaded.layouts[0].fences[0].items.len(), 2);
     }
 
     #[test]
